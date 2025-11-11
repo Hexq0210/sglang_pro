@@ -43,32 +43,12 @@ class SchedulerPPMixin:
             p2p_work = point_to_point_pyobj(
                 data,
                 self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.cpu_group,
+                self.world_group.device_group,
                 self.pp_rank * self.tp_size + dp_offset,
                 ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
                 async_send=async_send,
             )
         return p2p_work
-
-    def recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.attn_tp_rank == 0:
-            dp_offset = self.dp_rank * self.attn_tp_size
-            data = point_to_point_pyobj(
-                [],
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.cpu_group,
-                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
-                self.pp_rank * self.tp_size + dp_offset,
-            )
-        else:
-            data = None
-
-        if self.tp_size != 1:
-            data = broadcast_pyobj(
-                data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
-            )
-
-        return data
 
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -165,7 +145,7 @@ class SchedulerPPMixin:
             # send ready PP output to rank 0
             if mbs[next_first_rank_mb_id] is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                torch.cuda.current_stream().wait_event(q_event)
+                torch.get_device_module(self.device).current_stream().wait_event(q_event)
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs_to_send.tensors,
@@ -208,8 +188,8 @@ class SchedulerPPMixin:
                 batch_result = self._pp_prep_batch_result(
                     mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
                 )
-                d2h_event = torch.cuda.Event()
-                d2h_event.record(torch.cuda.current_stream())
+                d2h_event = torch.get_device_module(self.device).Event()
+                d2h_event.record(torch.get_device_module(self.device).current_stream())
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
@@ -227,8 +207,8 @@ class SchedulerPPMixin:
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                 )
-                event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream())
+                event = torch.get_device_module(self.device).Event()
+                event.record(torch.get_device_module(self.device).current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
@@ -346,7 +326,7 @@ class SchedulerPPMixin:
                     last_mbs[next_mb_id] = mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        torch.cuda.current_stream().wait_event(event)
+                        torch.get_device_module(self.device).current_stream().wait_event(event)
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
@@ -373,15 +353,10 @@ class SchedulerPPMixin:
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
         if bootstrapped_rids is not None:
-            (
-                good_consensus_bootstrapped_rids,
-                bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids,
-                    bad_rids_to_check=bad_consensus_bootstrapped_rids,
+                    rids_to_check=bootstrapped_rids,
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -392,47 +367,36 @@ class SchedulerPPMixin:
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            bootstrapped_reqs, failed_reqs = (
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                    return_failed_reqs=True
+                )
             )
+            bootstrapped_rids = [req.rid for req in bootstrapped_reqs] + [
+                req.rid for req in failed_reqs
+            ]
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
+            bootstrapped_rids = self.recv_pyobj_from_prev_stage()
+            bootstrapped_reqs = (
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                    rids_to_check=bootstrapped_rids
+                )
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
-            )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
-            )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+        self.waiting_queue.extend(bootstrapped_reqs)
+        return bootstrapped_rids
 
     def _pp_pd_get_transferred_ids(self: Scheduler):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = self.get_transferred_rids()
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self.recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            curr_transferred_rids = self.get_transferred_rids()
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
@@ -547,6 +511,37 @@ class SchedulerPPMixin:
         send_release_work = []
         send_transfer_work = []
 
+        import os
+        import torch
+        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1"
+        if enable_profiling:
+            prof_cnt = 0
+            import torch_npu
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+                l2_cache=False,
+                data_simplification=False,
+            )
+            profiling_path = "profiling/"
+            prof = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    profiling_path
+                ),
+                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=10, repeat=1, skip_first=1),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+                with_flops=False,
+                with_modules=False,
+                experimental_config=experimental_config)
+
+        prof_bs = 2
+
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -599,11 +594,22 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.cur_batch:
+                    if enable_profiling:
+                        if len(batch.reqs) >= prof_bs and prof_cnt == 0:
+                            prof.start()
+                            prof_cnt += 1
+                        if prof_cnt > 0:
+                            prof_cnt += 1
+                        if prof_cnt == 10:
+                            torch.npu.synchronize()
+                            prof.stop()
                     result, event = self._pp_launch_batch(
                         mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
                     )
+                    if enable_profiling and prof_cnt > 0 and prof_cnt < 10:
+                        prof.step()
                 if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    next_pp_outputs, next_batch_result, d2h_event, _ = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -658,15 +664,15 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if self.cur_batch:
-                        torch.cuda.current_stream().wait_event(event)
+                        torch.get_device_module(self.device).current_stream().wait_event(event)
                         send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                         )
 
-                if self.delayed_weight_sync_fn:
-                    self.delayed_weight_sync_fn()
-                    self.delayed_weight_sync_fn = None
+                # if self.delayed_weight_sync_fn:
+                #     self.delayed_weight_sync_fn()
+                #     self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
