@@ -1734,80 +1734,57 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.kv_lora_rank,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.v_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            if self.index_head_dim is not None:
-                self.index_k_buffer = torch.zeros(
-                    (
-                        layer_num,
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        1,
-                        self.index_head_dim,
-                    ),
+            self.kv_buffer = [
+                torch.zeros(
+                    (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
                     dtype=self.store_dtype,
-                    device=self.device,
+                    device=device,
                 )
+                for _ in range(layer_num)
+            ]
+
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.layer_transfer_counter = None
+
+        kv_size = self.get_kv_size_bytes()
+        logger.info(
+            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
+        )
+        self.mem_usage = kv_size / GB
 
         self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
-        assert hasattr(self, "k_buffer")
-        assert hasattr(self, "v_buffer")
+        assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
-        for k_cache in self.k_buffer:
-            kv_size_bytes += get_tensor_size_bytes(k_cache)
-        for v_cache in self.v_buffer:
-            kv_size_bytes += get_tensor_size_bytes(v_cache)
-        if self.index_head_dim is not None:
-            assert hasattr(self, "index_k_buffer")
-            for index_k_cache in self.index_k_buffer:
-                kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += np.prod(kv_cache.shape) * kv_cache.dtype.itemsize
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
-        )
+        return (self.get_key_buffer(layer_id), self.get_value_buffer(layer_id))
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.kv_buffer[layer_id - self.start_layer][...,:self.kv_lora_rank]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return self.kv_buffer[layer_id - self.start_layer][
+                ..., : self.kv_lora_rank
+            ].view(self.dtype)
+        return self.kv_buffer[layer_id - self.start_layer][...,self.kv_lora_rank:]
 
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1820,25 +1797,11 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
-            self.v_buffer[i].data_ptr() for i in range(self.layer_num)
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
         ]
-        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
-        if self.index_head_dim is not None:
-            kv_data_ptrs += [
-                self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
-            ]
-            kv_data_lens += [
-                self.index_k_buffer[i].nbytes for i in range(self.layer_num)
-            ]
-            kv_item_lens += [
-                self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
-            ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
@@ -1851,29 +1814,13 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
-
         if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
-
-        if cache_v is None:
-            cache_k, cache_v = cache_k.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                self.store_dtype
             )
+        else:
+            self.kv_buffer[layer_id - self.start_layer][loc] = torch.concat([cache_k, cache_v], dim=-1)
 
-        torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
-            loc.view(-1, 1),
-            cache_k.view(-1, 1, self.kv_lora_rank),
-        )
-        torch_npu.npu_scatter_nd_update_(
-            self.v_buffer[layer_id - self.start_layer].view(
-                -1, 1, self.qk_rope_head_dim
-            ),
-            loc.view(-1, 1),
-            cache_v.view(-1, 1, self.qk_rope_head_dim),
-        )
 
     def set_index_k_buffer(
         self,

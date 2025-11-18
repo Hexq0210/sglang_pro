@@ -238,22 +238,7 @@ class MooncakeKVManager(CommonKVManager):
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-            )
-
-        # Batch register auxiliary data buffers
-        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-            )
-
-        # Batch register state/extra pool data buffers
-        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
-            self.engine.batch_register(
-                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-            )
+        return
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
@@ -339,10 +324,18 @@ class MooncakeKVManager(CommonKVManager):
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+                for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                    src_addr = src_ptr + int(prefill_index[0]) * item_len
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                    length = item_len * len(prefill_index)
+                    status = self.engine.transfer_sync(
+                        mooncake_session_id, src_addr, dst_addr, length
+                    )
+
+                    if status != 0:
+                        return status
+            return 0
 
         if self.enable_custom_mem_pool:
             futures = [
