@@ -510,37 +510,7 @@ class SchedulerPPMixin:
         send_proxy_work = []
         send_release_work = []
         send_transfer_work = []
-
-        import os
-        import torch
-        enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1"
-        if enable_profiling:
-            prof_cnt = 0
-            import torch_npu
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-                l2_cache=False,
-                data_simplification=False,
-            )
-            profiling_path = "profiling/"
-            prof = torch_npu.profiler.profile(
-                activities=[
-                    torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU,
-                ],
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                    profiling_path
-                ),
-                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=10, repeat=1, skip_first=1),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=False,
-                with_flops=False,
-                with_modules=False,
-                experimental_config=experimental_config)
-
-        prof_bs = 2
+        send_output_work = []
 
         while True:
             server_is_idle = True
@@ -581,9 +551,9 @@ class SchedulerPPMixin:
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                self._pp_commit_comm_work(send_proxy_work)
                 if self.server_args.pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    self._pp_commit_comm_work(send_output_work)
+                    next_pp_outputs, next_batch_result, d2h_event, send_output_work = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -593,23 +563,14 @@ class SchedulerPPMixin:
                             pp_outputs,
                         )
                     )
+                self._pp_commit_comm_work(send_proxy_work)
                 if self.cur_batch:
-                    if enable_profiling:
-                        if len(batch.reqs) >= prof_bs and prof_cnt == 0:
-                            prof.start()
-                            prof_cnt += 1
-                        if prof_cnt > 0:
-                            prof_cnt += 1
-                        if prof_cnt == 10:
-                            torch.npu.synchronize()
-                            prof.stop()
                     result, event = self._pp_launch_batch(
                         mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
                     )
-                    if enable_profiling and prof_cnt > 0 and prof_cnt < 10:
-                        prof.step()
                 if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event, _ = (
+                    self._pp_commit_comm_work(send_output_work)
+                    next_pp_outputs, next_batch_result, d2h_event, send_output_work = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,

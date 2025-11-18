@@ -1027,6 +1027,12 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_offset = Parameter(
             layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
         )
+        layer.w2_weight.data = torch_npu.npu_format_cast(
+            layer.w13_weight.data, 29
+        )
+        layer.w2_weight.data = torch_npu.npu_format_cast(
+            layer.w13_weight.data, 29
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
