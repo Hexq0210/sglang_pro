@@ -27,7 +27,6 @@ import psutil
 import setproctitle
 import zmq
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -69,6 +68,7 @@ class LoadBalanceMethod(Enum):
     """Load balance method."""
 
     ROUND_ROBIN = auto()
+    DECODE_ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
     MINIMUM_TOKENS = auto()
 
@@ -148,6 +148,7 @@ class DataParallelController:
         self.round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
+            LoadBalanceMethod.DECODE_ROUND_ROBIN: self.decode_round_robin_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
             LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
         }
@@ -162,7 +163,6 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
-        self.total_req_num = 0
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -480,20 +480,22 @@ class DataParallelController:
                 self.workers
             )
         else:
-            dp_round_robin = envs.SGLANG_DP_ROUND_ROBIN.get()
-            if dp_round_robin and self.server_args.disaggregation_mode == "decode":
-                self.total_req_num = (
-                    1
-                    if self.total_req_num == len(self.workers)
-                    else self.total_req_num + 1
-                )
-                select_result = (self.total_req_num - 1) % len(self.workers)
-            else:
-                assert (
-                    req.bootstrap_room is not None
-                ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
-                select_result = req.bootstrap_room % len(self.workers)
-            self.workers[select_result].send_pyobj(req)
+            assert (
+                req.bootstrap_room is not None
+            ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
+            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+
+    def decode_round_robin_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        if self.server_args.disaggregation_mode == "decode":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+            return
+        self.round_robin_scheduler(req)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
