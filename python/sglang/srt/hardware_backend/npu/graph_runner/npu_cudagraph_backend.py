@@ -23,6 +23,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -50,6 +51,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._use_sync_graph_update = (
+            envs.SGLANG_NPU_GRAPH_UPDATE_SYNC_LAUNCH.get()
+            and cuda_graph_runner.model_runner.spec_algorithm.is_dspark()
+        )
+        self._sync_graph_update_stream = None
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
@@ -168,11 +174,33 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         graph = self._graphs[shape_key]
 
         self._device_module.set_device(self._device_id)
+        self._maybe_use_sync_graph_update(graph)
         graph.update(cpu_update_input=cpu_update_input)
         graph.replay()
         return self._outputs[shape_key]
+
+    def _maybe_use_sync_graph_update(self, graph) -> None:
+        if not self._use_sync_graph_update:
+            return
+        stream_type = getattr(self._device_module, "SyncLaunchStream", None)
+        if stream_type is None:
+            self._use_sync_graph_update = False
+            return
+        mode = getattr(graph, "graph_dispatch_mode", None)
+        update_stream = getattr(mode, "update_stream", None)
+        if update_stream is None or isinstance(update_stream, stream_type):
+            return
+        if self._sync_graph_update_stream is None:
+            # Create only when submitting an update, never during capture.
+            # SyncLaunchStream bypasses the host enqueue/dequeue round trips;
+            # it does not synchronize device execution. Keep update-before-
+            # replay and TorchNPU's per-node external events unchanged.
+            self._sync_graph_update_stream = stream_type(device=self._device_id)
+        # Shadow the dispatch mode's shared class attribute for this graph.
+        mode.update_stream = self._sync_graph_update_stream
 
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
+        self._sync_graph_update_stream = None
