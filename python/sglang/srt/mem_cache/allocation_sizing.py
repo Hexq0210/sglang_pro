@@ -48,10 +48,16 @@ def get_alloc_len_per_decode() -> int:
 def get_alloc_reserve_per_decode() -> int:
     """KV length reserved per request at each decode step.
 
-    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_utils.eagle_prepare_for_decode.
+    The 2x absorbs the kv_committed_len lag in overlap mode. DSpark draft
+    prefetch needs one more block: after this verify commits, its next draft
+    writes query KV beyond the newly accepted prefix, before the scheduler
+    has reserved the next decode window.
     """
-    return 2 * get_alloc_len_per_decode()
+    spec = get_spec()
+    dspark_prefetch = spec.speculative_algorithm == "DSPARK" and getattr(
+        spec, "speculative_dspark_draft_prefetch", False
+    )
+    return (3 if dspark_prefetch else 2) * get_alloc_len_per_decode()
 
 
 def page_aligned_decode_alloc_lens(
@@ -88,9 +94,14 @@ def get_req_to_token_extra_context_len() -> int:
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (max_speculative_num_draft_tokens() or 0)
     page_size = get_alloc_page_size()
-    if get_spec().speculative_algorithm is not None and page_size > 1:
+    spec = get_spec()
+    dspark_prefetch = spec.speculative_algorithm == "DSPARK" and getattr(
+        spec, "speculative_dspark_draft_prefetch", False
+    )
+    if spec.speculative_algorithm is not None and (page_size > 1 or dspark_prefetch):
         # kv_allocated_len is page-aligned (eagle_prepare_for_decode), so near
         # the context limit the aligned reserve can overshoot by page_size - 1;
         # without the headroom the row write silently lands in the neighbor row.
+        # Prefetch also needs the full reserve at page_size == 1.
         extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
     return extra

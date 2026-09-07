@@ -9,7 +9,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_reserve_per_decode,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
@@ -144,7 +147,7 @@ class DFlashDraftInputV2(SpecInput):
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
-        reserve = 2 * block_size
+        reserve = get_alloc_reserve_per_decode()
         page_size = batch.token_to_kv_pool_allocator.page_size
 
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(

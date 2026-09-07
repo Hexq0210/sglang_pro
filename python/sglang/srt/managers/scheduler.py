@@ -1776,7 +1776,14 @@ class Scheduler(
                 _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        self._war_barrier_enabled = (
+            is_cuda()
+            or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+            # Prefetched outputs are produced on forward_stream and consumed by
+            # schedule-stream filter/merge, including on NPU. Their publication
+            # fence also protects the extra next-round req_to_token/KV reads.
+            or get_spec().speculative_dspark_draft_prefetch
+        )
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 

@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_prefetch import DSparkDraftInputV2
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -112,8 +113,12 @@ def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
-) -> DFlashDraftInputV2:
-    return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+) -> DSparkDraftInputV2:
+    return make_draft_input_v2(
+        bonus_tokens=bonus_tokens,
+        new_seq_lens=new_seq_lens,
+        input_cls=DSparkDraftInputV2,
+    )
 
 
 def resolve_greedy_mask(
@@ -234,6 +239,40 @@ class DraftBlockProposer:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
+    def _embed_module(self, target_model):
+        return unwrap_lora_layer(
+            self.draft_model.embed_tokens
+            if not self.sample_from_anchor
+            else target_model.get_input_embeddings()
+        )
+
+    def prefetch(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DSparkDraftInputV2,
+        verify_window: VerifyWindow,
+        bs: int,
+        device: str,
+        target_model,
+    ) -> None:
+        """Cache only backbone outputs; the next propose owns all sampling."""
+        assert self._draft_sampler is None, "Prefetch must not execute a sampler tail"
+        fwd = self._run_forward(
+            batch=batch,
+            draft_input=draft_input,
+            verify_window=verify_window,
+            bs=bs,
+            device=device,
+            embed_module=self._embed_module(target_model),
+        )
+        # Graph outputs and the proposer's input buffer are reused by later
+        # forwards. Own the cached rows before the scheduler filters/merges them.
+        draft_input.prefetched_hidden = fwd.raw_hidden.reshape(
+            bs, self.gamma, *fwd.raw_hidden.shape[1:]
+        ).clone()
+        draft_input.prefetched_block_ids = fwd.draft_block_ids.clone()
+
     def propose(
         self,
         *,
@@ -245,23 +284,35 @@ class DraftBlockProposer:
         target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = unwrap_lora_layer(
-            self.draft_model.embed_tokens
-            if not self.sample_from_anchor
-            else target_model.get_input_embeddings()
-        )
+        embed_module = self._embed_module(target_model)
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
-        fwd = self._run_forward(
-            batch=batch,
-            draft_input=draft_input,
-            verify_window=verify_window,
-            bs=bs,
-            device=device,
-            embed_module=embed_module,
-            draft_sampler=draft_sampler,
-            sampling_info=sampling_info,
+        hidden, block_ids = (
+            draft_input.take_prefetched()
+            if isinstance(draft_input, DSparkDraftInputV2)
+            else (None, None)
         )
+        if hidden is not None:
+            assert draft_sampler is None, "Backbone prefetch cannot run a sampler tail"
+            assert hidden.shape[:2] == (bs, self.gamma)
+            assert block_ids.shape == (bs, self.query_token_num)
+            fwd = DraftForwardResult(
+                draft_block_ids=block_ids,
+                raw_hidden=hidden.flatten(0, 1),
+                draft_hidden_3d=hidden.reshape(bs, self.gamma, -1),
+                can_run_graph=False,
+            )
+        else:
+            fwd = self._run_forward(
+                batch=batch,
+                draft_input=draft_input,
+                verify_window=verify_window,
+                bs=bs,
+                device=device,
+                embed_module=embed_module,
+                draft_sampler=draft_sampler,
+                sampling_info=sampling_info,
+            )
         draft_block_ids = fwd.draft_block_ids
 
         folded_confidence = None
@@ -405,6 +456,13 @@ class DraftBlockProposer:
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
+        elif not getattr(
+            self.draft_model_runner.attn_backend, "needs_cpu_seq_lens", True
+        ):
+            # Device-only backends use the real GPU prefix. Do not substitute
+            # allocation headroom for accepted sequence lengths during prefetch.
+            draft_seq_lens_cpu = None
+            draft_seq_lens_sum = None
         elif draft_input.nxt_kv_lens_cpu is not None:
             draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)

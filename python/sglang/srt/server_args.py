@@ -2109,6 +2109,13 @@ class ServerArgs:
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
         NS("spec"),
     ] = None
+    speculative_dspark_draft_prefetch: A[
+        bool,
+        "DSPARK only. Pre-run the next draft backbone after hidden-state commit. "
+        "Sampling remains in the next iteration; uses one extra KV block per request "
+        "and disables folded proposal sampling. MoE drafts with attention DP are unsupported.",
+        NS("spec"),
+    ] = False
     speculative_dspark_sps_table_path: A[
         Optional[str],
         "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "

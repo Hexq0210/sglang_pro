@@ -128,6 +128,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    if cfg.speculative_dspark_draft_prefetch and cfg.speculative_algorithm != "DSPARK":
+        raise ValueError("--speculative-dspark-draft-prefetch requires DSPARK.")
+    if cfg.speculative_dspark_draft_prefetch and cfg.enable_unified_memory:
+        raise ValueError(
+            "--speculative-dspark-draft-prefetch does not support unified memory: "
+            "in-flight compaction does not track the prefetched draft's KV writes."
+        )
+
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
     if cfg.speculative_draft_window_size is not None:

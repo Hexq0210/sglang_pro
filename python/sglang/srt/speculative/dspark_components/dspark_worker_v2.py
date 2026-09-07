@@ -1,5 +1,6 @@
 import logging
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import replace
 from typing import Optional
 
@@ -19,6 +20,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     compute_position,
 )
 from sglang.srt.runtime_context import (
@@ -63,6 +65,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_prefetch import DSparkDraftInputV2
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -75,6 +78,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
     prepare_mamba_track_for_verify,
+    spec_stage_span,
 )
 from sglang.srt.utils import (
     is_cuda,
@@ -110,7 +114,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
+        self.enable_draft_prefetch = get_spec().speculative_dspark_draft_prefetch
+        self._last_shared_read_runner = self.model_runner
+
         self._draft_is_moe = draft_is_deepseek_v4()
+        if (
+            self.enable_draft_prefetch
+            and self._draft_is_moe
+            and get_parallel().enable_dp_attention
+        ):
+            raise ValueError(
+                "--speculative-dspark-draft-prefetch does not support MoE drafts "
+                "with attention DP: cached and cold ranks must coordinate draft "
+                "collectives and idle participation."
+            )
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
         )
@@ -342,6 +359,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         return target_model.model.get_input_embeddings()
 
     @property
+    def last_shared_read_runner(self):
+        return self._last_shared_read_runner
+
+    @property
     def carries_confidence(self) -> bool:
         return self._verify_planner.carries_confidence
 
@@ -408,7 +429,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # block eagerly from the graph's hidden states instead. Apart
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
-                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                if (
+                    envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+                    and not self.enable_draft_prefetch
+                ):
                     self._draft_sampler = self._maybe_build_draft_sampler(
                         available_memory_gb=available_mem
                     )
@@ -467,6 +491,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
+        self._last_shared_read_runner = self.model_runner
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -823,6 +848,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
+        if self.enable_draft_prefetch:
+            self._prefetch_draft_forward(batch, next_draft_input)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
@@ -836,6 +863,52 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _prefetch_draft_forward(
+        self, batch: ScheduleBatch, next_draft_input: DSparkDraftInputV2
+    ) -> None:
+        # Only called after decode commit and observation. PD prefill is pruned
+        # to KV injection and deliberately enters its first decode without cache.
+        bs = len(batch.seq_lens)
+        if bs == 0:
+            return
+        # Use a shallow view so the current result and scheduler snapshot retain
+        # their original lengths, mode and allocation metadata even on failure.
+        next_batch = copy(batch)
+        next_batch.forward_mode = ForwardMode.DECODE
+        next_batch.seq_lens = next_draft_input.new_seq_lens
+        next_batch.spec_info = next_draft_input
+        needs_cpu = getattr(
+            self.draft_model_runner.attn_backend, "needs_cpu_seq_lens", True
+        )
+        next_batch.seq_lens_cpu = next_batch.seq_lens.to("cpu") if needs_cpu else None
+        next_batch.seq_lens_sum = (
+            int(next_batch.seq_lens_cpu.sum()) if needs_cpu else None
+        )
+        with self._draft_context(), spec_stage_span("draft_prefetch"):
+            window = alloc_verify_window(
+                batch=next_batch,
+                bs=bs,
+                device=self.device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
+            )
+            self._proposer.prefetch(
+                batch=next_batch,
+                draft_input=next_draft_input,
+                verify_window=window,
+                bs=bs,
+                device=self.device,
+                target_model=self.target_worker.model_runner.model,
+            )
+        # The target's earlier metadata event no longer fences the last shared
+        # req_to_token/KV reads. Include the cache copies too: schedule-stream
+        # filter/merge may immediately consume their outputs after this fence.
+        done = torch.get_device_module(self.device).Event()
+        done.record()
+        self.draft_model_runner.shared_read_done_event = done
+        self._last_shared_read_runner = self.draft_model_runner
 
     def _commit_target_mamba_states_after_verify(
         self,

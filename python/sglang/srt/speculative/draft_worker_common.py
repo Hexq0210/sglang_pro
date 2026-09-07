@@ -109,10 +109,11 @@ def make_draft_input_v2(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
+    input_cls: type[DFlashDraftInputV2] = DFlashDraftInputV2,
 ) -> DFlashDraftInputV2:
     bs = int(new_seq_lens.numel())
     device = bonus_tokens.device
-    return DFlashDraftInputV2(
+    return input_cls(
         topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
         topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
         bonus_tokens=bonus_tokens.to(dtype=torch.int64),
