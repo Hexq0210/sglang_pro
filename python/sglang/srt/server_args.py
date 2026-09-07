@@ -2111,9 +2111,11 @@ class ServerArgs:
     ] = None
     speculative_dspark_draft_prefetch: A[
         bool,
-        "DSPARK only. Pre-run the next draft backbone after hidden-state commit. "
-        "Sampling remains in the next iteration; uses one extra KV block per request "
-        "and disables folded proposal sampling. MoE drafts with attention DP are unsupported.",
+        "DSPARK only. Run the complete next draft proposal after target verify and "
+        "hidden-state commit, starting with a mock proposal. Uses one extra KV block "
+        "per request and caches proposal logits for rejection sampling; changes RNG "
+        "consumption and disables folded proposal sampling. MoE drafts with attention "
+        "DP are unsupported.",
         NS("spec"),
     ] = False
     speculative_dspark_sps_table_path: A[

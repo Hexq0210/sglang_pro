@@ -801,6 +801,10 @@ class DsparkStepObservers:
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
 
+    @property
+    def needs_draft_logits(self) -> bool:
+        return self._block_accept_recorder is not None
+
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
         if self._block_accept_recorder is None:
             return None
@@ -838,21 +842,55 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        confidence_raw: Optional[torch.Tensor] = None,
+        confidence_valid: Optional[torch.Tensor] = None,
     ) -> None:
         planner = self._planner
         if not proposal_folded:
+            # A carried proposal can be filtered or merged with bootstrap rows.
+            # The head's last output has neither transformation, so use the
+            # request-aligned snapshot when prefetch supplies its validity mask.
+            raw = (
+                planner.last_confidence_raw
+                if confidence_valid is None
+                else confidence_raw
+            )
+            observed_ids, observed_logits, observed_bs = (
+                verify_ids_2d,
+                target_logits,
+                bs,
+            )
+            if (
+                confidence_valid is not None
+                and raw is not None
+                and (
+                    self._sts_collect_path
+                    or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+                )
+            ):
+                indices = confidence_valid.nonzero().flatten()
+                observed_bs = indices.numel()
+                if observed_bs:
+                    raw = raw[indices]
+                    observed_ids = verify_ids_2d[indices]
+                    observed_logits = target_logits.view(
+                        bs, self._verify_num_draft_tokens, -1
+                    )[indices].flatten(0, 1)
+                else:
+                    raw = None
             self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
+                verify_ids_2d=observed_ids,
+                target_logits=observed_logits,
+                bs=observed_bs,
+                confidence_raw=raw,
             )
             self._confidence_probe.maybe_observe(
                 carries_confidence=planner.carries_confidence,
                 is_compact_mode=planner.is_compact_mode,
-                confidence_raw=planner.last_confidence_raw,
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
+                confidence_raw=raw,
+                verify_ids_2d=observed_ids,
+                target_logits=observed_logits,
+                bs=observed_bs,
             )
         if self._block_accept_recorder is not None and not proposal_folded:
             self._block_accept_recorder.observe_verify_step(
@@ -934,12 +972,12 @@ class DsparkStepObservers:
         verify_ids_2d: torch.Tensor,
         target_logits: Optional[torch.Tensor],
         bs: int,
+        confidence_raw: Optional[torch.Tensor],
     ) -> None:
         if not self._sts_collect_path:
             return
         if not self._planner.carries_confidence:
             return
-        confidence_raw = self._planner.last_confidence_raw
         if confidence_raw is None:
             return
         if self._sts_recorder is None:

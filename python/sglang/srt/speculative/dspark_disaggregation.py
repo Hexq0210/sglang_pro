@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.dspark_components.dspark_draft import make_next_draft_input
 
 if TYPE_CHECKING:
@@ -21,6 +22,11 @@ def build_dspark_disagg_draft_input(
     spec_info = make_next_draft_input(
         bonus_tokens=last_tokens_tensor,
         new_seq_lens=batch.seq_lens,
+        prefetch_gamma=(
+            get_spec().speculative_num_draft_tokens - 1
+            if get_spec().speculative_dspark_draft_prefetch
+            else None
+        ),
     )
     if batch.enable_overlap:
         spec_info.future_dsa_topk_indices_available = False

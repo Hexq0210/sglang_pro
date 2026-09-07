@@ -283,11 +283,10 @@ class FutureMap:
             self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # Keep CPU length preparation behind acceptance publication, rather than
+        # the scheduler's WAR fence. NPU draft prefetch also enables that fence;
+        # a .cpu() on schedule_stream would otherwise wait for the entire draft.
+        if _is_cuda or (_is_npu and get_spec().speculative_dspark_draft_prefetch):
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
