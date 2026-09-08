@@ -492,6 +492,19 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
+        # DSPARK already resolved these exact accepted lengths before launching
+        # its carried draft. The owned mirror follows request filter/merge, so
+        # reading it needs neither a second D2H nor a wait for the later draft.
+        prefetched_seq_lens_cpu = getattr(draft_input, "prefetched_seq_lens_cpu", None)
+        if prefetched_seq_lens_cpu is not None:
+            assert prefetched_seq_lens_cpu.device.type == "cpu"
+            assert prefetched_seq_lens_cpu.shape == batch.seq_lens.shape
+            batch.seq_lens_cpu = prefetched_seq_lens_cpu
+            batch.seq_lens_sum = int(prefetched_seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return
+
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())

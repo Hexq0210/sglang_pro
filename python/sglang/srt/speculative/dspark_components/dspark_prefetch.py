@@ -26,6 +26,7 @@ def deterministic_draft_logits(tokens: torch.Tensor, vocab_size: int) -> torch.T
 
 @dataclass
 class DSparkDraftInputV2(DFlashDraftInputV2):
+    prefetched_seq_lens_cpu: Optional[torch.Tensor] = None
     prefetched_tokens: Optional[torch.Tensor] = None
     prefetched_logits: Optional[torch.Tensor] = None
     prefetched_confidence: Optional[torch.Tensor] = None
@@ -51,11 +52,28 @@ class DSparkDraftInputV2(DFlashDraftInputV2):
         )
 
     def store_prefetched(
-        self, tokens, logits, confidence, *, confidence_raw=None
+        self,
+        tokens,
+        logits,
+        confidence,
+        *,
+        confidence_raw=None,
+        clone_outputs=True,
+        carry_confidence=True,
     ) -> None:
-        # Own graph outputs before a subsequent replay reuses their storage.
-        self.prefetched_tokens = tokens.clone()
-        self.prefetched_logits = None if logits is None else logits.clone()
+        # Folded sampling exposes reusable graph buffers. Eager sampling returns
+        # fresh stack/cat outputs whose ownership can pass directly to the state.
+        self.prefetched_tokens = tokens.clone() if clone_outputs else tokens
+        self.prefetched_logits = (
+            logits.clone() if logits is not None and clone_outputs else logits
+        )
+        if not carry_confidence:
+            # Static verify has no confidence consumer. Do not launch fill
+            # kernels for an unused confidence block and validity mask.
+            self.prefetched_confidence = None
+            self.prefetched_confidence_raw = None
+            self.prefetched_confidence_valid = None
+            return
         self.prefetched_confidence = (
             torch.zeros_like(tokens, dtype=torch.float32)
             if confidence is None
@@ -106,6 +124,11 @@ class DSparkDraftInputV2(DFlashDraftInputV2):
         new_indices_cpu: Optional[List[int]] = None,
     ):
         # FutureMap's early return filters only future_indices in the base.
+        if self.prefetched_seq_lens_cpu is not None:
+            indices_cpu = (
+                new_indices_cpu if new_indices_cpu is not None else new_indices.cpu()
+            )
+            self.prefetched_seq_lens_cpu = self.prefetched_seq_lens_cpu[indices_cpu]
         self._record_prefetch_stream()
         for name in (
             "prefetched_tokens",
@@ -120,6 +143,15 @@ class DSparkDraftInputV2(DFlashDraftInputV2):
         super().filter_batch(new_indices, new_indices_cpu)
 
     def merge_batch(self, spec_info: DFlashDraftInputV2):
+        other_seq_lens_cpu = getattr(spec_info, "prefetched_seq_lens_cpu", None)
+        if self.prefetched_seq_lens_cpu is not None and other_seq_lens_cpu is not None:
+            self.prefetched_seq_lens_cpu = torch.cat(
+                [self.prefetched_seq_lens_cpu, other_seq_lens_cpu]
+            )
+        else:
+            # A legacy/idle arrival may lack a mirror. Let FutureMap resolve the
+            # complete merged batch rather than retain a partial CPU snapshot.
+            self.prefetched_seq_lens_cpu = None
         self._record_prefetch_stream()
         if isinstance(spec_info, DSparkDraftInputV2):
             spec_info._record_prefetch_stream()
@@ -149,16 +181,19 @@ class DSparkDraftInputV2(DFlashDraftInputV2):
                 if right_raw is None:
                     right_raw = torch.zeros_like(other_tokens, dtype=raw_dtype)
                 self.prefetched_confidence_raw = torch.cat([left_raw, right_raw], dim=0)
-            self.prefetched_confidence_valid = torch.cat(
-                [
-                    self.prefetched_confidence_valid,
-                    spec_info.prefetched_confidence_valid,
-                ]
-            )
+            for name in ("prefetched_confidence", "prefetched_confidence_valid"):
+                left_value, right_value = getattr(self, name), getattr(spec_info, name)
+                if left_value is not None or right_value is not None:
+                    if left_value is None:
+                        left_value = right_value.new_zeros(
+                            (self.prefetched_tokens.shape[0], *right_value.shape[1:])
+                        )
+                    if right_value is None:
+                        right_value = left_value.new_zeros(
+                            (other_tokens.shape[0], *left_value.shape[1:])
+                        )
+                    setattr(self, name, torch.cat([left_value, right_value]))
             self.prefetched_tokens = torch.cat(
                 [self.prefetched_tokens, other_tokens], dim=0
-            )
-            self.prefetched_confidence = torch.cat(
-                [self.prefetched_confidence, spec_info.prefetched_confidence], dim=0
             )
         super().merge_batch(spec_info)

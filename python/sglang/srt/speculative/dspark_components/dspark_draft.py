@@ -119,6 +119,7 @@ def make_next_draft_input(
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
     prefetch_gamma: Optional[int] = None,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
 ) -> DSparkDraftInputV2:
     state = make_draft_input_v2(
         bonus_tokens=bonus_tokens,
@@ -127,6 +128,8 @@ def make_next_draft_input(
     )
     if prefetch_gamma is not None:
         state.init_mock_proposal(prefetch_gamma)
+        if seq_lens_cpu is not None:
+            state.prefetched_seq_lens_cpu = seq_lens_cpu.clone()
     return state
 
 
@@ -262,6 +265,7 @@ class DraftBlockProposer:
         sampling_info,
         vocab_size: int,
         require_logits: bool = False,
+        compact: bool = True,
     ) -> DraftProposal:
         tokens, logits, confidence, confidence_raw, confidence_valid = (
             draft_input.take_prefetched()
@@ -282,11 +286,12 @@ class DraftBlockProposer:
             if sampling_info is None
             else sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
         )
-        return DraftProposal(
+        anchors = draft_input.bonus_tokens.view(-1, 1)
+        if compact:
             # Compact verify kernels address anchors with a gamma row stride.
-            draft_block_ids=draft_input.bonus_tokens.view(-1, 1)
-            .expand(-1, self.gamma)
-            .contiguous(),
+            anchors = anchors.expand(-1, self.gamma).contiguous()
+        return DraftProposal(
+            draft_block_ids=anchors,
             draft_block=DraftBlockResult(
                 draft_tokens=tokens,
                 corrected_logits=logits,

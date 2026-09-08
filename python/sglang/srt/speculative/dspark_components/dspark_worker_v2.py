@@ -574,6 +574,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
             prefetch_gamma=self.gamma if self.enable_draft_prefetch else None,
+            seq_lens_cpu=batch.seq_lens_cpu,
         )
         return batch_output
 
@@ -675,6 +676,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 vocab_size=self.target_worker.model_runner.model_config.vocab_size,
                 require_logits=self._observers.needs_draft_logits,
+                compact=self._verify_planner.is_compact_mode,
             )
         else:
             with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
@@ -869,7 +871,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
-            prefetch_gamma=self.gamma if self.enable_draft_prefetch else None,
         )
         if self.enable_draft_prefetch:
             self._prefetch_draft_proposal(
@@ -904,16 +905,32 @@ class DSparkWorkerV2(BaseSpecWorker):
         if stream is None:
             stream = device_module.Stream()
             self._prefetch_lengths_d2h_stream = stream
-        source = new_seq_lens.clone()
-        host = torch.empty_like(source, device="cpu", pin_memory=True)
-        ready = device_module.Event()
+            self._prefetch_lengths_ready = device_module.Event()
+            self._prefetch_lengths_done = device_module.Event()
+        host_buffer = getattr(self, "_prefetch_lengths_cpu_buffer", None)
+        if (
+            host_buffer is None
+            or host_buffer.numel() < new_seq_lens.numel()
+            or host_buffer.dtype != new_seq_lens.dtype
+        ):
+            host_buffer = torch.empty(
+                (max(32, new_seq_lens.numel()),),
+                dtype=new_seq_lens.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._prefetch_lengths_cpu_buffer = host_buffer
+        host = host_buffer[: new_seq_lens.numel()].view(new_seq_lens.shape)
+        ready = self._prefetch_lengths_ready
+        done = self._prefetch_lengths_done
         ready.record()
         stream.wait_event(ready)
         with device_module.stream(stream):
-            host.copy_(source, non_blocking=True)
-            done = device_module.Event()
+            # The draft waits for this copy before returning, so even folded
+            # accept buffers cannot be replayed/overwritten while it is in flight.
+            host.copy_(new_seq_lens, non_blocking=True)
             done.record()
-            source.record_stream(stream)
+            new_seq_lens.record_stream(stream)
         return host, done
 
     def _prefetch_draft_proposal(
@@ -942,6 +959,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_batch.seq_lens_cpu, copy_done = prefetch_lengths
             if copy_done is not None:
                 copy_done.synchronize()
+            # Retain an owned CPU mirror for the next scheduler iteration. The
+            # pinned staging buffer above is reused by the next forward.
+            next_draft_input.prefetched_seq_lens_cpu = next_batch.seq_lens_cpu.clone()
         else:
             next_batch.seq_lens_cpu = None
         next_batch.seq_lens_sum = (
@@ -965,12 +985,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_model=self.target_worker.model_runner.model,
                 sampling_info=batch.sampling_info,
             )
-            confidence = self._verify_planner.compute_confidence_tensor(
-                draft_hidden=proposal.draft_hidden,
-                anchor_tokens=next_draft_input.bonus_tokens,
-                draft_tokens=proposal.draft_block.draft_tokens,
-                confidence_tap=proposal.confidence_tap,
-            )
+            confidence = proposal.confidence
+            if confidence is None:
+                confidence = self._verify_planner.compute_confidence_tensor(
+                    draft_hidden=proposal.draft_hidden,
+                    anchor_tokens=next_draft_input.bonus_tokens,
+                    draft_tokens=proposal.draft_block.draft_tokens,
+                    confidence_tap=proposal.confidence_tap,
+                )
             # Greedy acceptance needs tokens only. Avoid retaining/cloning a
             # full vocabulary block unless sampling or diagnostics consume q.
             keep_logits = (
@@ -981,7 +1003,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 proposal.draft_block.draft_tokens,
                 proposal.draft_block.corrected_logits if keep_logits else None,
                 confidence,
-                confidence_raw=self._verify_planner.last_confidence_raw,
+                confidence_raw=(
+                    None
+                    if proposal.folded
+                    else self._verify_planner.last_confidence_raw
+                ),
+                clone_outputs=proposal.folded,
+                carry_confidence=self._verify_planner.carries_confidence,
             )
         # The target's earlier metadata event no longer fences the last shared
         # req_to_token/KV reads. Include the cache copies too: schedule-stream
