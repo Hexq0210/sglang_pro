@@ -16,7 +16,11 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
-from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
+from sglang.srt.hardware_backend.npu.attention.mla_cache import (
+    MLA_PREFIX_BATCH_EXPAND_LIMIT,
+    gather_mla_cache_pages,
+    per_request_mla_prefix_attention,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -1644,6 +1648,29 @@ class AscendAttnBackend(AttentionBackend):
 
             k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if (
+                sum(forward_batch.extend_prefix_lens_cpu)
+                > MLA_PREFIX_BATCH_EXPAND_LIMIT
+            ):
+                assert layer.kv_b_proj is not None
+                # Expanding all cached prefixes at once can use many GiB even
+                # when this batch has only a few new tokens (e.g. Kimi-K3).
+                return per_request_mla_prefix_attention(
+                    q,
+                    k,
+                    v,
+                    k_buffer=k_buffer,
+                    v_buffer=v_buffer,
+                    prefix_block_tables=self.forward_metadata.flatten_prefix_block_tables,
+                    prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    page_size=self.page_size,
+                    kv_b_proj=layer.kv_b_proj,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    scale=layer.scaling,
+                    causal_mask=self.fia_mask,
+                    is_nz=is_fia_nz(),
+                ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
             kv_cached = gather_mla_cache_pages(
                 k_buffer,
                 self.forward_metadata.flatten_prefix_block_tables,
